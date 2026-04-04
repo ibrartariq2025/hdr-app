@@ -2,12 +2,12 @@ import cv2
 import numpy as np
 from typing import List
 
-def resize_to_match(images):
-    """Resize all images to match the LARGEST one"""
+def resize_to_match(images, scale=0.5):
+    """Resize all images to half size to save memory"""
     heights = [img.shape[0] for img in images]
     widths = [img.shape[1] for img in images]
-    target_h = max(heights)
-    target_w = max(widths)
+    target_h = int(max(heights) * scale)
+    target_w = int(max(widths) * scale)
     return [cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
             for img in images]
 
@@ -24,7 +24,7 @@ def weight_saturation(bgr):
     float_img = bgr.astype(np.float32) / 255.0
     return np.std(float_img, axis=2) + 1e-6
 
-def build_laplacian_pyramid(img, levels=6):
+def build_laplacian_pyramid(img, levels=5):
     pyramid = []
     current = img.copy()
     for _ in range(levels):
@@ -36,13 +36,13 @@ def build_laplacian_pyramid(img, levels=6):
     pyramid.append(current)
     return pyramid
 
-def build_gaussian_pyramid(img, levels=6):
+def build_gaussian_pyramid(img, levels=5):
     pyramid = [img]
     for _ in range(levels):
         pyramid.append(cv2.pyrDown(pyramid[-1]))
     return pyramid
 
-def blend_laplacian(images, weight_maps, levels=6):
+def blend_laplacian(images, weight_maps, levels=5):
     n = len(images)
     lap_pyramids = [build_laplacian_pyramid(img.astype(np.float32), levels) for img in images]
     gauss_pyramids = [build_gaussian_pyramid(wt, levels) for wt in weight_maps]
@@ -65,7 +65,8 @@ def blend_laplacian(images, weight_maps, levels=6):
     return np.clip(result, 0, 255).astype(np.uint8)
 
 def merge_hdr(images):
-    images = resize_to_match(images)
+    # Process at half resolution to save memory
+    images = resize_to_match(images, scale=0.5)
     all_weights = []
     for img in images:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -77,4 +78,4 @@ def merge_hdr(images):
         all_weights.append((w_exp * w_cont * w_sat).astype(np.float32))
     weight_sum = sum(all_weights) + 1e-12
     norm_weights = [w / weight_sum for w in all_weights]
-    return blend_laplacian(images, norm_weights, levels=6)
+    return blend_laplacian(images, norm_weights, levels=5)
