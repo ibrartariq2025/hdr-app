@@ -2,6 +2,15 @@ import cv2
 import numpy as np
 from typing import List
 
+def resize_to_match(images):
+    """Resize all images to match the smallest one"""
+    heights = [img.shape[0] for img in images]
+    widths = [img.shape[1] for img in images]
+    target_h = min(heights)
+    target_w = min(widths)
+    return [cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4) 
+            for img in images]
+
 def weight_exposure(channel, sigma=0.2):
     norm = channel.astype(np.float32) / 255.0
     return np.exp(-((norm - 0.5) ** 2) / (2 * sigma ** 2))
@@ -56,6 +65,9 @@ def blend_laplacian(images, weight_maps, levels=6):
     return np.clip(result, 0, 255).astype(np.uint8)
 
 def merge_hdr(images):
+    # Fix: resize all images to same size first
+    images = resize_to_match(images)
+    
     all_weights = []
     for img in images:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
