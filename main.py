@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import cv2, numpy as np, uuid, os, tempfile
+import cv2, numpy as np, os, tempfile, gc
 from hdr_merge import merge_hdr
 from tone_mapper import tone_map_real_estate
 
@@ -19,21 +19,27 @@ def decode_image(contents: bytes, filename: str) -> np.ndarray:
                 tmp.write(contents)
                 tmp_path = tmp.name
             with rawpy.imread(tmp_path) as raw:
+                # half_size=True cuts memory usage by 75%
+                # Still gives excellent quality for HDR merge
                 rgb = raw.postprocess(
                     use_camera_wb=True,
                     no_auto_bright=True,
-                    output_bps=16,
-                    half_size=False
+                    output_bps=8,
+                    half_size=True
                 )
             os.unlink(tmp_path)
-            rgb_8bit = (rgb / 256).astype(np.uint8)
-            return cv2.cvtColor(rgb_8bit, cv2.COLOR_RGB2BGR)
+            del contents
+            gc.collect()
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         except Exception as e:
             print(f"RAW decode error: {e}")
             return None
     else:
         arr = np.frombuffer(contents, np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        del contents
+        gc.collect()
+        return img
 
 @app.get("/")
 def root():
@@ -43,35 +49,42 @@ def root():
 async def process_hdr(files: list[UploadFile] = File(...)):
     images = []
     for f in files:
+        print(f"Loading {f.filename}...")
         contents = await f.read()
         img = decode_image(contents, f.filename)
         if img is not None:
             images.append(img)
+            print(f"Loaded {f.filename}: {img.shape}")
         else:
             print(f"Could not decode: {f.filename}")
+        gc.collect()  # Free memory after each file
 
     if len(images) < 2:
         return JSONResponse(status_code=400, content={
             "error": f"Could not decode enough images. Decoded {len(images)}/{len(files)}"
         })
 
+    print(f"Processing {len(images)} images...")
     merged = merge_hdr(images)
-    final = tone_map_real_estate(merged)
+    del images
+    gc.collect()
 
-    # Encode directly to JPEG in memory — no disk needed
+    final = tone_map_real_estate(merged)
+    del merged
+    gc.collect()
+
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, 97]
     success, buffer = cv2.imencode('.jpg', final, encode_params)
+    del final
+    gc.collect()
 
     if not success:
         return JSONResponse(status_code=500, content={"error": "Failed to encode image"})
 
-    # Return image directly in response
     return Response(
         content=buffer.tobytes(),
         media_type="image/jpeg",
         headers={
             "Content-Disposition": "attachment; filename=hdr_result.jpg",
-            "X-Resolution": f"{final.shape[1]}x{final.shape[0]}",
-            "X-Images-Used": str(len(images))
         }
     )
