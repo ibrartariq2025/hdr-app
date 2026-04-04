@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import cv2, numpy as np, uuid, os, shutil
+import cv2, numpy as np, uuid, os
 from hdr_merge import merge_hdr
 from tone_mapper import tone_map_real_estate
 
@@ -17,10 +17,6 @@ def root():
 
 @app.post("/process")
 async def process_hdr(files: list[UploadFile] = File(...)):
-    if len(files) < 2:
-        return JSONResponse(status_code=400, content={"error": "Upload at least 2 bracketed images"})
-
-    job_id = str(uuid.uuid4())[:8]
     images = []
     for f in files:
         contents = await f.read()
@@ -30,11 +26,12 @@ async def process_hdr(files: list[UploadFile] = File(...)):
             images.append(img)
 
     if len(images) < 2:
-        return JSONResponse(status_code=400, content={"error": "Could not decode images"})
+        return JSONResponse(status_code=400, content={"error": "Could not decode images, need at least 2"})
 
     merged = merge_hdr(images)
     final = tone_map_real_estate(merged)
 
+    job_id = str(uuid.uuid4())[:8]
     out_path = f"outputs/{job_id}_hdr.jpg"
     cv2.imwrite(out_path, final, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
