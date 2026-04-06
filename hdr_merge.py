@@ -27,8 +27,8 @@ def detect_ghosts(images):
     ghost_mask = cv2.GaussianBlur(ghost_mask, (0,0), 3.0)
     return np.clip(ghost_mask, 0, 1)
 
-def merge_hdr(images):
-    images = resize_to_match(images, scale=0.5)
+def merge_hdr(images, scale=0.5):
+    images = resize_to_match(images, scale=scale)
     print("Aligning images...")
     images = align_bracket(images)
 
