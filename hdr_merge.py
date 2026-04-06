@@ -12,83 +12,90 @@ def get_luminance(img):
     f = img.astype(np.float32) / 255.0
     return 0.2126*f[:,:,2] + 0.7152*f[:,:,1] + 0.0722*f[:,:,0]
 
+def detect_ghosts(images):
+    normalized = []
+    for img in images:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        mean = float(np.mean(gray)) + 1e-6
+        normalized.append(gray / mean)
+    stack = np.stack(normalized, axis=0)
+    stddev = np.std(stack, axis=0)
+    threshold = float(np.mean(stddev) + 2.0 * np.std(stddev))
+    ghost_mask = (stddev > threshold).astype(np.float32)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    ghost_mask = cv2.dilate(ghost_mask, kernel)
+    ghost_mask = cv2.GaussianBlur(ghost_mask, (0,0), 3.0)
+    return np.clip(ghost_mask, 0, 1)
+
 def merge_hdr(images):
     images = resize_to_match(images, scale=0.5)
     print("Aligning images...")
     images = align_bracket(images)
 
-    # Sort darkest to brightest
     lums = [float(get_luminance(img).mean()) for img in images]
     sorted_pairs = sorted(zip(lums, images), key=lambda x: x[0])
     sorted_images = [img for _, img in sorted_pairs]
-
-    darkest   = sorted_images[0]    # Exposed for highlights/windows/sky
-    brightest = sorted_images[-1]   # Exposed for shadows/interior
-    middle    = sorted_images[len(sorted_images)//2]  # Balanced midtones
-
+    darkest   = sorted_images[0]
+    brightest = sorted_images[-1]
+    middle    = sorted_images[len(sorted_images)//2]
     print(f"Exposures: dark={min(lums):.3f} mid={lums[len(lums)//2]:.3f} bright={max(lums):.3f}")
 
-    # Step 1: Mertens fusion as base
+    ghost_mask = detect_ghosts(images)
+    not_ghost = 1.0 - ghost_mask
+
     merge_mertens = cv2.createMergeMertens(
         contrast_weight=1.0, saturation_weight=1.0, exposure_weight=1.0)
     fused = merge_mertens.process(images)
     fused = np.clip(fused * 255, 0, 255).astype(np.uint8)
 
-    # Step 2: Detect regions from MIDDLE exposure
-    # Middle exposure is the reference — it shows us where windows are blown
-    # and where shadows are crushed, without being extreme itself
-    mid_lum = get_luminance(middle)
+    # KEY FIX: detect blown pixels from FUSED image not middle
+    # Only pixels that are ACTUALLY blown in fused result need darkest exposure
+    # Use very tight threshold — only genuinely overexposed pixels
+    fused_lum = get_luminance(fused)
 
-    # Window/highlight detection from middle exposure
-    # In middle exposure, windows are already blown (lum > 0.85)
-    # These are exactly the areas where we need the darkest exposure
-    p_hi = float(np.percentile(mid_lum, 88))
-    p_lo = float(np.percentile(mid_lum, 12))
-
-    # Highlight mask — areas blown in middle exposure
-    hi_thresh = float(np.clip(p_hi, 0.70, 0.88))
-    highlight_mask = np.clip((mid_lum - hi_thresh) / 0.10, 0, 1)
-    highlight_mask = cv2.GaussianBlur(highlight_mask.astype(np.float32), (0,0), 30.0)
+    # Tight highlight mask — only pixels above 0.92 (genuinely blown)
+    # No broad feathering — this prevents dark halos spreading into surroundings
+    highlight_hard = np.clip((fused_lum - 0.92) / 0.06, 0, 1)
+    # Use erosion before dilation to avoid halos
+    kernel_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    highlight_hard = cv2.erode(highlight_hard.astype(np.float32), kernel_sm)
+    # Only small smooth blur — keep mask tight
+    highlight_mask = cv2.GaussianBlur(highlight_hard, (0,0), 8.0)
     highlight_mask = np.clip(highlight_mask, 0, 1)
+    # Remove ghost areas
+    highlight_mask = highlight_mask * not_ghost
 
-    # Shadow mask — areas crushed in middle exposure
-    sh_thresh = float(np.clip(p_lo, 0.06, 0.22))
-    shadow_mask = np.clip((sh_thresh - mid_lum) / 0.08, 0, 1)
-    shadow_mask = cv2.GaussianBlur(shadow_mask.astype(np.float32), (0,0), 30.0)
+    # Shadow mask — from fused dark areas
+    shadow_hard = np.clip((0.12 - fused_lum) / 0.08, 0, 1)
+    shadow_hard = cv2.erode(shadow_hard.astype(np.float32), kernel_sm)
+    shadow_mask = cv2.GaussianBlur(shadow_hard, (0,0), 15.0)
     shadow_mask = np.clip(shadow_mask, 0, 1)
+    shadow_mask = shadow_mask * not_ghost
 
-    print(f"Window threshold: {hi_thresh:.2f}  Shadow threshold: {sh_thresh:.2f}")
+    print(f"Blown pixels: {float(np.mean(highlight_mask)):.1%}  "
+          f"Shadow pixels: {float(np.mean(shadow_mask)):.1%}")
 
-    # Step 3: Start with fused as base
     result_lab = cv2.cvtColor(fused, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    # Step 4: WINDOW PULL
-    # Take ONLY L (luminance/detail) from darkest exposure
-    # Keep A+B (color) from fused — prevents blue sky / color cast
+    # WINDOW PULL — L channel only from darkest, keep fused color
+    # Only applied to genuinely blown pixels — no dark halos
     dark_lab = cv2.cvtColor(darkest, cv2.COLOR_BGR2LAB).astype(np.float32)
     dark_lum = get_luminance(darkest)
-    # Only apply where darkest has actual detail (not pitch black)
     dark_has_detail = np.clip((dark_lum - 0.02) / 0.15, 0, 1)
     window_strength = highlight_mask * dark_has_detail
-    # Blend L channel only
     result_lab[:,:,0] = result_lab[:,:,0] * (1 - window_strength) +                         dark_lab[:,:,0] * window_strength
-    # Color stays from fused — no blue cast
+    # Keep fused color channels — no cast
 
-    # Step 5: SHADOW LIFT
-    # Take full pixel from brightest for dark interior areas
-    # Brightest exposure has well-lit interior, so color is natural
+    # SHADOW LIFT — from brightest where not blown
     bright_lab = cv2.cvtColor(brightest, cv2.COLOR_BGR2LAB).astype(np.float32)
     bright_lum = get_luminance(brightest)
-    # Only apply where brightest is not blown
     bright_not_blown = np.clip((0.95 - bright_lum) / 0.15, 0, 1)
     shadow_strength = shadow_mask * bright_not_blown
-    # Blend full LAB for shadows — color from bright exposure is fine here
     result_lab[:,:,0] = result_lab[:,:,0] * (1 - shadow_strength) +                         bright_lab[:,:,0] * shadow_strength
     result_lab[:,:,1] = result_lab[:,:,1] * (1 - shadow_strength) +                         bright_lab[:,:,1] * shadow_strength
     result_lab[:,:,2] = result_lab[:,:,2] * (1 - shadow_strength) +                         bright_lab[:,:,2] * shadow_strength
 
     result = cv2.cvtColor(
         np.clip(result_lab, 0, 255).astype(np.uint8),
-        cv2.COLOR_LAB2BGR
-    )
+        cv2.COLOR_LAB2BGR)
     return result
